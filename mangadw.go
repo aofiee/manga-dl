@@ -19,8 +19,14 @@ import (
 var target string
 
 const (
-	chBuf = 10
+	chBuf = 100
 )
+
+type scraping struct {
+	collector *colly.Collector
+}
+
+type pFunc func(_ int, elem *colly.HTMLElement)
 
 func main() {
 	log.SetFlags(log.Ltime)
@@ -32,6 +38,13 @@ func main() {
 func setTargetURL(t *string) {
 	*t = os.Args[1]
 }
+func (s *scraping) scraping(url string, findSelector string, useSelector string, p pFunc) {
+	s.collector.OnHTML(findSelector, func(e *colly.HTMLElement) {
+		e.ForEach(useSelector, p)
+	})
+	s.collector.Visit(url)
+
+}
 func arg() bool {
 	red := color.New(color.FgRed, color.Bold).SprintFunc()
 	if len(os.Args) != 2 {
@@ -41,53 +54,30 @@ func arg() bool {
 	return true
 }
 func grepLessonLink() {
-	green := color.New(color.FgGreen, color.Bold).SprintFunc()
 	cyan := color.New(color.FgCyan, color.Italic).SprintFunc()
-
-	c := colly.NewCollector()
-
-	c.OnResponse(func(r *colly.Response) {
-		log.Println("response received", r.StatusCode)
+	c := scraping{colly.NewCollector()}
+	c.scraping(target, "div.table-responsive", "a", func(_ int, elem *colly.HTMLElement) {
+		link := elem.Attr("href")
+		chanSendLink := make(chan string, chBuf)
+		chanDownloaded := make(chan bool)
+		go grepLessonInBook(chanSendLink, link)
+		go extracAllPagesFromLesson(chanSendLink, chanDownloaded)
+		log.Println("Downloaded "+cyan(link)+" : ", <-chanDownloaded)
 	})
-	c.OnHTML("div.table-responsive", func(e *colly.HTMLElement) {
-		e.ForEach("a", func(_ int, elem *colly.HTMLElement) {
-			link := elem.Attr("href")
-			chanSendLink := make(chan string, chBuf)
-			chanDownloaded := make(chan bool)
-			go grepLessonInBook(chanSendLink, link)
-			go extracAllPagesFromLesson(chanSendLink, chanDownloaded)
-			log.Println("Downloaded "+cyan(link)+" : ", <-chanDownloaded)
-		})
-	})
-	c.OnRequest(func(r *colly.Request) {
-		log.Println("Visiting : ", green(r.URL))
-	})
-	c.Visit(target)
 }
 func grepLessonInBook(ch chan<- string, l string) {
-	c := colly.NewCollector()
+	c := scraping{colly.NewCollector()}
 	color := color.New(color.FgBlue, color.Italic).SprintFunc()
-	c.OnHTML("#page_select1", func(e *colly.HTMLElement) {
-		e.ForEach("option", func(_ int, elem *colly.HTMLElement) {
-			ch <- elem.Attr("value")
-			log.Println(color("Send : ", elem.Attr("value")))
-		})
-		defer close(ch)
+	c.scraping(l, "#page_select1", "option", func(_ int, elem *colly.HTMLElement) {
+		ch <- elem.Attr("value")
+		log.Println(color("Send : ", elem.Attr("value")))
 	})
-
-	c.Visit(l)
+	defer close(ch)
 }
 func extracAllPagesFromLesson(ch <-chan string, done chan bool) {
-	chanExtractLink := make(chan map[string]string, chBuf)
-	chanDoneExtractLink := make(chan bool)
-	go exctractImgSrc(ch, chanExtractLink)
-	go downloadAndSave(chanExtractLink, chanDoneExtractLink)
-	log.Println("chanDoneExtractLink ", <-chanDoneExtractLink)
-	defer close(done)
-	done <- true
-}
-func exctractImgSrc(rootCh <-chan string, chanExtractLink chan<- map[string]string) {
-	for v := range rootCh {
+	for v := range ch {
+		v := v
+
 		u, err := url.Parse(v)
 		if err != nil {
 			log.Fatal(err)
@@ -102,37 +92,23 @@ func exctractImgSrc(rootCh <-chan string, chanExtractLink chan<- map[string]stri
 			}
 		}
 		color := color.New(color.FgGreen, color.Italic).SprintFunc()
-		c := colly.NewCollector()
-		c.OnResponse(func(r *colly.Response) {
-			// log.Println("response received", r.StatusCode)
+		c := scraping{colly.NewCollector()}
+		c.scraping(v, "body > div.container-fluid > center > div.display_content", "img", func(_ int, elem *colly.HTMLElement) {
+			go func() {
+				log.Println(color("Waiting to Download : ", elem.Attr("src")))
+				url, destination := strings.TrimSpace(elem.Attr("src")), destination
+				data, err := downloadFile(url)
+				if err != nil {
+					log.Fatal(err)
+				}
+				filename := path.Base(url)
+				saveImg(filename, destination, data)
+			}()
 		})
-		c.OnHTML("body > div.container-fluid > center > div.display_content > img", func(e *colly.HTMLElement) {
-			log.Println("Prepare to Download : ", color(strings.TrimSpace(e.Attr("src"))))
-			var chanPipe map[string]string
-			chanPipe = make(map[string]string)
-			chanPipe["url"], chanPipe["destination"] = strings.TrimSpace(e.Attr("src")), destination
-			chanExtractLink <- chanPipe
-		})
-		c.OnRequest(func(r *colly.Request) {
-			// log.Println("Page : ", green(r.URL))
-		})
-		c.Visit(v)
 	}
-	defer close(chanExtractLink)
-}
-func downloadAndSave(chanExtractLink <-chan map[string]string, done chan bool) {
-	for v := range chanExtractLink {
-
-		filename := path.Base(v["url"])
-		chanStart := make(chan []byte, chBuf)
-		chanDone := make(chan bool)
-		go downloadFile(v["url"], chanStart, chanDone)
-		go saveImg(filename, v["destination"], chanStart, chanDone)
-	}
-	defer close(done)
 	done <- true
 }
-func saveImg(filename string, des string, ch <-chan []byte, done chan bool) {
+func saveImg(filename string, des string, data []byte) {
 	color := color.New(color.FgMagenta, color.Italic).SprintFunc()
 	path := fmt.Sprintf(`%v/%v`, des, filename)
 	f, err := os.Create(path)
@@ -142,29 +118,26 @@ func saveImg(filename string, des string, ch <-chan []byte, done chan bool) {
 	defer func() {
 		log.Println(color("-------save------- : ", path))
 		f.Close()
-		done <- true
 	}()
-	_, errCopy := io.Copy(f, bytes.NewReader(<-ch))
+	_, errCopy := io.Copy(f, bytes.NewReader(data))
 	if errCopy != nil {
 		log.Fatal(errCopy)
 	}
 }
 
-func downloadFile(s string, ch chan<- []byte, done chan bool) {
+func downloadFile(s string) ([]byte, error) {
 	color := color.New(color.FgRed, color.Italic).SprintFunc()
 	res, err := http.Get(s)
 	if err != nil {
-		ch <- nil
+		return nil, err
 	}
 	defer func() {
-		log.Println(color("Downloader : ", s))
-		done <- true
+		log.Println(color("-------Download------- : ", s))
 		res.Body.Close()
-		close(ch)
 	}()
 	body, err := ioutil.ReadAll(res.Body)
 	if err != nil {
-		ch <- nil
+		return nil, err
 	}
-	ch <- body
+	return body, nil
 }
