@@ -11,6 +11,7 @@ import (
 	"os"
 	"path"
 	"strings"
+	"sync"
 
 	"github.com/fatih/color"
 	"github.com/gocolly/colly"
@@ -75,6 +76,7 @@ func grepLessonInBook(ch chan<- string, l string) {
 	defer close(ch)
 }
 func extracAllPagesFromLesson(ch <-chan string, done chan bool) {
+	counter := sync.WaitGroup{}
 	for v := range ch {
 		v := v
 
@@ -94,7 +96,9 @@ func extracAllPagesFromLesson(ch <-chan string, done chan bool) {
 		color := color.New(color.FgGreen, color.Italic).SprintFunc()
 		c := scraping{colly.NewCollector()}
 		c.scraping(v, "body > div.container-fluid > center > div.display_content", "img", func(_ int, elem *colly.HTMLElement) {
+			counter.Add(1)
 			go func() {
+				defer counter.Done()
 				log.Println(color("Waiting to Download : ", elem.Attr("src")))
 				url, destination := strings.TrimSpace(elem.Attr("src")), destination
 				data, err := downloadFile(url)
@@ -106,7 +110,12 @@ func extracAllPagesFromLesson(ch <-chan string, done chan bool) {
 			}()
 		})
 	}
-	done <- true
+	go func() {
+		counter.Wait()
+		done <- true
+		close(done)
+	}()
+
 }
 func saveImg(filename string, des string, data []byte) {
 	color := color.New(color.FgMagenta, color.Italic).SprintFunc()
