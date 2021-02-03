@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"path"
+	"runtime/trace"
 	"strings"
 	"sync"
 
@@ -20,8 +21,10 @@ import (
 var target string
 
 const (
-	chBuf = 100
+	chBuf = 1000
 )
+
+var downloadLink []map[string]string
 
 type scraping struct {
 	collector *colly.Collector
@@ -60,7 +63,7 @@ func grepLessonLink() {
 	c.scraping(target, "div.table-responsive", "a", func(_ int, elem *colly.HTMLElement) {
 		link := elem.Attr("href")
 		chanSendLink := make(chan string, chBuf)
-		chanDownloaded := make(chan bool)
+		chanDownloaded := make(chan bool, chBuf)
 		go grepLessonInBook(chanSendLink, link)
 		go extracAllPagesFromLesson(chanSendLink, chanDownloaded)
 		log.Println("Downloaded "+cyan(link)+" : ", <-chanDownloaded)
@@ -77,9 +80,15 @@ func grepLessonInBook(ch chan<- string, l string) {
 }
 func extracAllPagesFromLesson(ch <-chan string, done chan bool) {
 	counter := sync.WaitGroup{}
+	f, err := os.Create(".trace.log")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer f.Close()
+	trace.Start(f)
+	defer trace.Stop()
 	for v := range ch {
 		v := v
-
 		u, err := url.Parse(v)
 		if err != nil {
 			log.Fatal(err)
@@ -96,19 +105,25 @@ func extracAllPagesFromLesson(ch <-chan string, done chan bool) {
 		color := color.New(color.FgGreen, color.Italic).SprintFunc()
 		c := scraping{colly.NewCollector()}
 		c.scraping(v, "body > div.container-fluid > center > div.display_content", "img", func(_ int, elem *colly.HTMLElement) {
-			counter.Add(1)
-			go func() {
-				defer counter.Done()
-				log.Println(color("Waiting to Download : ", elem.Attr("src")))
-				url, destination := strings.TrimSpace(elem.Attr("src")), destination
-				data, err := downloadFile(url)
-				if err != nil {
-					log.Fatal(err)
-				}
-				filename := path.Base(url)
-				saveImg(filename, destination, data)
-			}()
+			log.Println(color("Waiting to Download : ", elem.Attr("src")))
+			dl := make(map[string]string)
+			dl["destination"], dl["url"] = destination, strings.TrimSpace(elem.Attr("src"))
+			downloadLink = append(downloadLink, dl)
 		})
+	}
+	for _, v := range downloadLink {
+		v := v
+		counter.Add(1)
+		go func() {
+			defer counter.Done()
+			url, destination := v["url"], v["destination"]
+			data, err := downloadFile(url)
+			if err != nil {
+				log.Fatal(err)
+			}
+			filename := path.Base(url)
+			saveImg(filename, destination, data)
+		}()
 	}
 	go func() {
 		counter.Wait()
